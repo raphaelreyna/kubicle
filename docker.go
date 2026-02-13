@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -20,21 +21,30 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
-var _client *client.Client
+var (
+	_client     *client.Client
+	_clientOnce sync.Once
+	_clientErr  error
+)
 
-func getClient() *client.Client {
-	if _client == nil {
+func getClient() (*client.Client, error) {
+	_clientOnce.Do(func() {
 		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
-			panic(fmt.Sprintf("failed to create docker client: %v", err))
+			_clientErr = fmt.Errorf("failed to create docker client: %w", err)
+			return
 		}
 		_client = cli
-	}
-	return _client
+	})
+	return _client, _clientErr
 }
 
+// PullImage pulls a Docker image by name from a remote registry.
 func PullImage(ctx context.Context, name string) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
 	reader, err := cli.ImagePull(ctx, name, image.PullOptions{})
 	if err != nil {
@@ -50,8 +60,12 @@ func PullImage(ctx context.Context, name string) error {
 	return nil
 }
 
+// BuildImage builds a Docker image from the given tar archive build context.
 func BuildImage(ctx context.Context, name string, contextTarBall io.Reader) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
 	buildResp, err := cli.ImageBuild(ctx, contextTarBall, types.ImageBuildOptions{
 		Tags:           []string{name},
@@ -62,11 +76,22 @@ func BuildImage(ctx context.Context, name string, contextTarBall io.Reader) erro
 	if err != nil {
 		return fmt.Errorf("failed to build image: %w", err)
 	}
-	return buildResp.Body.Close()
+	defer buildResp.Body.Close()
+
+	// Consume the response body to ensure the build completes
+	_, err = io.Copy(io.Discard, buildResp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read image build response: %w", err)
+	}
+	return nil
 }
 
+// GetContainerNetworks returns the names of the Docker networks a container is attached to.
 func GetContainerNetworks(ctx context.Context, containerName string) ([]string, error) {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return nil, err
+	}
 
 	containerJSON, err := cli.ContainerInspect(ctx, containerName)
 	if err != nil {
@@ -80,14 +105,22 @@ func GetContainerNetworks(ctx context.Context, containerName string) ([]string, 
 	return networks, nil
 }
 
+// PortMap describes a port mapping between a host port and a container port.
 type PortMap struct {
 	Protocol  string
 	Host      int
 	Container int
 }
 
+// CreateContainer creates a new Docker container with the given image and port mappings.
+// It returns the container ID on success.
 func CreateContainer(ctx context.Context, name, image string, portMappings []PortMap) (string, error) {
-	containerconfig := container.Config{
+	cli, err := getClient()
+	if err != nil {
+		return "", err
+	}
+
+	containerConfig := container.Config{
 		Image: image,
 	}
 
@@ -107,7 +140,7 @@ func CreateContainer(ctx context.Context, name, image string, portMappings []Por
 		}
 	}
 
-	id, err := getClient().ContainerCreate(ctx, &containerconfig, hostConfig, nil, nil, name)
+	id, err := cli.ContainerCreate(ctx, &containerConfig, hostConfig, nil, nil, name)
 	if err != nil {
 		return "", fmt.Errorf("failed to create container: %w", err)
 	}
@@ -115,18 +148,27 @@ func CreateContainer(ctx context.Context, name, image string, portMappings []Por
 	return id.ID, nil
 }
 
-func StartContatiner(ctx context.Context, containerID string) error {
-	cli := getClient()
+// StartContainer starts a previously created Docker container.
+func StartContainer(ctx context.Context, containerID string) error {
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
-	err := cli.ContainerStart(ctx, containerID, container.StartOptions{})
+	err = cli.ContainerStart(ctx, containerID, container.StartOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 	return nil
 }
 
+// WaitForContainerReady blocks until the container reports a healthy status or the timeout is reached.
+// If timeout is zero, it defaults to 1 minute.
 func WaitForContainerReady(ctx context.Context, timeout time.Duration, containerID string) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
 	if timeout == 0 {
 		timeout = 1 * time.Minute
@@ -136,27 +178,38 @@ func WaitForContainerReady(ctx context.Context, timeout time.Duration, container
 
 	respChan, errChan := cli.ContainerWait(cctx, containerID, container.Healthy)
 	select {
-	case <-respChan:
+	case resp := <-respChan:
+		if resp.Error != nil {
+			return fmt.Errorf("container exited with error: %s", resp.Error.Message)
+		}
 		return nil
 	case err := <-errChan:
 		return fmt.Errorf("failed to wait for container: %w", err)
 	}
 }
 
+// AttachContainerToNetwork connects a container to a Docker network.
 func AttachContainerToNetwork(ctx context.Context, containerName string, networkName string) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
-	err := cli.NetworkConnect(ctx, networkName, containerName, nil)
+	err = cli.NetworkConnect(ctx, networkName, containerName, nil)
 	if err != nil {
 		return fmt.Errorf("failed to attach container to network: %w", err)
 	}
 	return nil
 }
 
+// ContainerExists reports whether a container with the given name exists.
 func ContainerExists(ctx context.Context, name string) (bool, error) {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return false, err
+	}
 
-	_, err := cli.ContainerInspect(ctx, name)
+	_, err = cli.ContainerInspect(ctx, name)
 	if err != nil {
 		if client.IsErrNotFound(err) {
 			return false, nil
@@ -166,10 +219,14 @@ func ContainerExists(ctx context.Context, name string) (bool, error) {
 	return true, nil
 }
 
+// RemoveContainer force-removes a Docker container.
 func RemoveContainer(ctx context.Context, containerID string) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
-	err := cli.ContainerRemove(ctx, containerID, container.RemoveOptions{
+	err = cli.ContainerRemove(ctx, containerID, container.RemoveOptions{
 		Force: true,
 	})
 	if err != nil {
@@ -178,16 +235,20 @@ func RemoveContainer(ctx context.Context, containerID string) error {
 	return nil
 }
 
+// PushImage pushes a Docker image to its registry.
 func PushImage(ctx context.Context, name string) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
 	credentials := struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}{}
-	credentialsJSON, err := json.Marshal(credentials)
-	if err != nil {
-		return fmt.Errorf("failed to marshal credentials: %w", err)
+	credentialsJSON, marshalErr := json.Marshal(credentials)
+	if marshalErr != nil {
+		return fmt.Errorf("failed to marshal credentials: %w", marshalErr)
 	}
 	credentialsJSONBase64 := base64.StdEncoding.EncodeToString(credentialsJSON)
 
@@ -207,10 +268,14 @@ func PushImage(ctx context.Context, name string) error {
 	return nil
 }
 
+// DeleteImage force-removes a Docker image by name.
 func DeleteImage(ctx context.Context, name string) error {
-	cli := getClient()
+	cli, err := getClient()
+	if err != nil {
+		return err
+	}
 
-	_, err := cli.ImageRemove(ctx, name, image.RemoveOptions{
+	_, err = cli.ImageRemove(ctx, name, image.RemoveOptions{
 		Force: true,
 	})
 	if err != nil {
@@ -219,23 +284,27 @@ func DeleteImage(ctx context.Context, name string) error {
 	return nil
 }
 
-func PushImageToClusterRegistry(ctx context.Context, clusterName, imageName, contextDir string) error {
+// PushImageToClusterRegistry builds a Docker image from contextDir, pushes it
+// to the local cluster registry at localhost:5000, and cleans up the local copy.
+func PushImageToClusterRegistry(ctx context.Context, imageName, contextDir string) error {
 	contextTarball, err := tarDirectory(contextDir)
 	if err != nil {
 		return fmt.Errorf("failed to create tarball: %w", err)
 	}
 
-	err = BuildImage(ctx, fmt.Sprintf("localhost:5000/%s", imageName), contextTarball)
+	registryImage := fmt.Sprintf("localhost:5000/%s", imageName)
+
+	err = BuildImage(ctx, registryImage, contextTarball)
 	if err != nil {
 		return fmt.Errorf("failed to build image: %w", err)
 	}
 
-	err = PushImage(ctx, fmt.Sprintf("localhost:5000/%s", imageName))
+	err = PushImage(ctx, registryImage)
 	if err != nil {
 		return fmt.Errorf("failed to push image to cluster registry: %w", err)
 	}
 
-	err = DeleteImage(ctx, fmt.Sprintf("localhost:5000/%s", imageName))
+	err = DeleteImage(ctx, registryImage)
 	if err != nil {
 		return fmt.Errorf("failed to delete image from local docker: %w", err)
 	}
@@ -247,14 +316,15 @@ func tarDirectory(dirPath string) (io.Reader, error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		defer pw.Close()
-
 		tw := tar.NewWriter(pw)
-		defer tw.Close()
 
-		dirPathBase := filepath.Base(dirPath)
+		var walkErr error
+		defer func() {
+			tw.Close()
+			pw.CloseWithError(walkErr)
+		}()
 
-		filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+		walkErr = filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -272,8 +342,8 @@ func tarDirectory(dirPath string) (io.Reader, error) {
 				return err
 			}
 
-			// Remove the leading directory name so paths in the tar are relative
-			relativePath := strings.TrimPrefix(path, dirPathBase)
+			// Remove the leading directory so paths in the tar are relative
+			relativePath := strings.TrimPrefix(path, dirPath)
 			relativePath = strings.TrimPrefix(relativePath, string(os.PathSeparator))
 			header.Name = relativePath
 

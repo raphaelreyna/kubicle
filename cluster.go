@@ -31,6 +31,8 @@ func writeOutConfigTemplate(address string) (string, error) {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 
+	defer file.Close()
+
 	err = tmplt.Execute(file, data)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute config template: %w", err)
@@ -39,6 +41,8 @@ func writeOutConfigTemplate(address string) (string, error) {
 	return file.Name(), nil
 }
 
+// Cluster represents a local kind Kubernetes cluster with an associated
+// container registry. It embeds a Kubernetes Clientset for direct API access.
 type Cluster struct {
 	Name       string
 	Kubeconfig string
@@ -46,6 +50,10 @@ type Cluster struct {
 	*kubernetes.Clientset
 }
 
+// NewCluster creates or reuses a kind cluster with the given name.
+// If a cluster with that name already exists, it reconnects to it.
+// Otherwise, a new cluster is created with the given timeout for readiness.
+// A local Docker registry is also created and attached to the cluster network.
 func NewCluster(ctx context.Context, name string, timeout time.Duration) (*Cluster, error) {
 	provider := cluster.NewProvider(
 		cluster.ProviderWithDocker(),
@@ -82,7 +90,7 @@ func NewCluster(ctx context.Context, name string, timeout time.Duration) (*Clust
 		if err != nil {
 			return nil, fmt.Errorf("failed to create cluster: %w", err)
 		}
-		kubeconfig, err = provider.KubeConfig("test-cluster", false)
+		kubeconfig, err = provider.KubeConfig(name, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
 		}
@@ -108,17 +116,17 @@ func NewCluster(ctx context.Context, name string, timeout time.Duration) (*Clust
 		Clientset:  cs,
 		Delete: func(ctx context.Context) error {
 			registryName := fmt.Sprintf("%s-registry", name)
-			err := RemoveContainer(ctx, registryName)
-			if err != nil {
-				return fmt.Errorf("failed to remove registry container: %w", err)
+			var errs []error
+
+			if err := RemoveContainer(ctx, registryName); err != nil {
+				errs = append(errs, fmt.Errorf("failed to remove registry container: %w", err))
 			}
 
-			clusterErr := provider.Delete(name, "")
-			if clusterErr != nil {
-				err = errors.Join(err, fmt.Errorf("failed to delete cluster: %w", clusterErr))
+			if err := provider.Delete(name, ""); err != nil {
+				errs = append(errs, fmt.Errorf("failed to delete cluster: %w", err))
 			}
 
-			return err
+			return errors.Join(errs...)
 		},
 	}
 
@@ -163,7 +171,7 @@ func createRegistryInNetwork(ctx context.Context, clusterName string) error {
 		return fmt.Errorf("failed to attach registry container to network: %w", err)
 	}
 
-	err = StartContatiner(ctx, registryContainerID)
+	err = StartContainer(ctx, registryContainerID)
 	if err != nil {
 		return fmt.Errorf("failed to start registry container: %w", err)
 	}
@@ -171,14 +179,19 @@ func createRegistryInNetwork(ctx context.Context, clusterName string) error {
 	return nil
 }
 
+// BuildAndPushImage builds a Docker image from localPath and pushes it to the
+// cluster's local registry, making it available for use in the cluster.
 func (c *Cluster) BuildAndPushImage(ctx context.Context, imageName, localPath string) error {
-	return PushImageToClusterRegistry(ctx, c.Name, imageName, localPath)
+	return PushImageToClusterRegistry(ctx, imageName, localPath)
 }
 
+// RegistryName returns the in-cluster address of the local Docker registry.
 func (c *Cluster) RegistryName() string {
 	return fmt.Sprintf("%s-registry:5000", c.Name)
 }
 
+// ImageName returns the fully qualified image reference for use in Kubernetes
+// pod specs, prefixed with the cluster's registry address.
 func (c *Cluster) ImageName(image string) string {
 	return fmt.Sprintf("%s/%s", c.RegistryName(), image)
 }

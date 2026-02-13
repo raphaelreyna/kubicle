@@ -176,7 +176,7 @@ func WaitForContainerReady(ctx context.Context, timeout time.Duration, container
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	respChan, errChan := cli.ContainerWait(cctx, containerID, container.Healthy)
+	respChan, errChan := cli.ContainerWait(cctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case resp := <-respChan:
 		if resp.Error != nil {
